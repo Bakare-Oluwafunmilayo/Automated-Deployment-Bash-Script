@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 # ===============================================================================================================================================================
 #Description:A robust, production-grade Bash script that automates the setup, deployment, and configuration of a Dockerized application on a remote Linux server.
@@ -7,70 +7,88 @@
 set -e #Makes the script exit immediately if any command fails...it helps prevent continuing after an error.
 
 LOG="deploy_$(date +%Y%m%d_%H%M%S).log"
-exec > >(tee -a "$LOG") 2>&1
-trap 'echo " Error on line $LINENO (see $LOG)"; exit 1' ERR
+# POSIX-safe redirection (no process substitution)
+exec 3>&1 1>>"$LOG" 2>&1
+trap 'echo "Error occurred. See $LOG." >&3; exit 1' EXIT
 
 # --- Handle Cleanup Flag ---
-if [[ $1 == "--cleanup" ]]; then
-  read -p "Enter your Server username: " SSH_USER
-  read -p "Input your Server IP: " SERVER_IP
-  read -p "Enter SSH key path: " SSH_KEY
-  read -p "Enter your App name: " APP
-  echo " Cleaning up $APP..."
-  ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash <<EOF
-docker rm -f \$(docker ps -aq --filter "name=${APP,,}") 2>/dev/null || true
-docker network rm ${APP,,}_net 2>/dev/null || true
-sudo rm -f /etc/nginx/sites-{available,enabled}/$APP
+if [ "$1" = "--cleanup" ]; then
+    printf "Enter your Server username: "
+    read SSH_USER
+    printf "Input your Server IP: "
+    read SERVER_IP
+    printf "Enter SSH key path: "
+    read SSH_KEY
+    printf "Enter your App name: "
+    read APP
+    APP_LC=$(echo "$APP" | tr '[:upper:]' '[:lower:]')
+    echo " Cleaning up $APP..."
+    ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" sh <<EOF
+docker rm -f \$(docker ps -aq --filter "name=$APP_LC") 2>/dev/null || true
+docker network rm ${APP_LC}_net 2>/dev/null || true
+sudo rm -f /etc/nginx/sites-available/$APP /etc/nginx/sites-enabled/$APP
 sudo systemctl reload nginx || true
 EOF
-echo " Cleanup complete."
-exit 0
+    echo " Cleanup complete."
+    exit 0
 fi
 
 # 1️⃣ Collect Parameters from User Input and validate them
 
 #Git Repository URL details
-read -p " Enter your Git repo URL (e.g. https://github.com/username/repo.git): " GIT_URL #Prompts user for the Git repository URL and stores it in GIT_URL
+printf "Enter your Git repo URL: "
+read GIT_URL
 #Check if GIT_URL is empty; if so, prints error and exits.
-[[ -z "$GIT_URL" ]] && { echo "Invalid Git URL format."; exit 1; }
+[ -z "$GIT_URL" ] && { echo "Invalid Git URL format."; exit 1; }
 
 #Personal Access Token (PAT) details
-read -s -p " Enter your Personal Access Token(PAT): " PAT; echo  #Reads Personal Access Token silently (-s hides input), then prints a newline.
+printf "Enter your Personal Access Token (PAT): "
+stty -echo
+read PAT
+stty echo
+printf "\n"
 #Ensures PAT isn’t empty.
-[[ -z "$PAT" ]] && { echo "PAT compulsory."; exit 1; }
+[ -z "$PAT" ] && { echo "PAT compulsory."; exit 1; }
 
 #Branch name
-read -p " Enter the Branch name [press Enter for 'main']: " BRANCH
+printf "Enter the Branch name [press Enter for 'main']: "
+read BRANCH
 BRANCH=${BRANCH:-main} #Prompts for branch name; if user presses Enter, defaults to main.
 
 #Remote Server SSH Details
 echo "Enter your remote server SSH details:"
-read -p " Enter your remote server username: " SSH_USER  #Prompts for SSH username, ensures it’s not blank.
-[[ -z "$SSH_USER" ]] && { echo " Username cannot be empty."; exit 1; }
+printf "Enter your remote server username: "
+read SSH_USER
+[ -z "$SSH_USER" ] && { echo "Username cannot be empty."; exit 1; }
 
 #IP address
-read -p " Enter your remote server IP address: " SERVER_IP   #Asks for the server’s IP address.
-[[ ! "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { echo "IP address format not supported."; exit 1; }
+printf "Enter your remote server IP address: "
+read SERVER_IP
+echo "$SERVER_IP" | grep '^[0-9]\{1,3\}\(\.[0-9]\{1,3\}\)\{3\}$' >/dev/null || {
+  echo "Invalid IP address format."; exit 1; }
+  
+# SSH Key
+printf "Enter your SSH key file path (e.g. ~/.ssh/id_rsa): "
+read SSH_KEY
+[ ! -f "$SSH_KEY" ] && { echo "SSH key not found."; exit 1; }
 
-#SSH Key
-read -p " Enter your SSH key file path (e.g. ~/.ssh/id_rsa) : " SSH_KEY  #Prompts for SSH private key path and checks if file exists.
-[[ ! -f "$SSH_KEY" ]] && { echo "SSH key not found."; exit 1; }
-
-#Application port
-read -p "   Enter your application port (e.g. 8080): " APP_PORT #Asks for application port number.
-#Validates port is numeric and within 1–65535 range
-if [[ ! "$APP_PORT" =~ ^[0-9]+$ || $APP_PORT -lt 1 || $APP_PORT -gt 65535 ]]; then
-  echo " Enter correct port."
+printf "Enter your application port (e.g. 8080): "
+read APP_PORT
+echo "$APP_PORT" | grep '^[0-9][0-9]*$' >/dev/null || {
+  echo "Port must be a number."; exit 1; }
+if [ "$APP_PORT" -lt 1 ] || [ "$APP_PORT" -gt 65535 ]; then
+  echo "Port must be between 1 and 65535."
   exit 1
 fi
 
-read -p "Enter your domain name (leave blank to use server IP): " DOMAIN
+printf "Enter your domain name (leave blank to use server IP): "
+read DOMAIN
 DOMAIN=${DOMAIN:-_}
 
 #Makes all collected variables available to later scripts (e.g., a deployment script).
 export GIT_URL PAT BRANCH SSH_USER SERVER_IP SSH_KEY APP_PORT DOMAIN
 
-REPO_NAME=$(basename -s .git "$GIT_URL")
+REPO_NAME=$(basename "$GIT_URL" .git)
 
 # --- Summary of Collected Inputs ---
 echo
@@ -182,24 +200,32 @@ echo " Building and running containers..."
 if [ -f "docker-compose.yml" ]; then
   docker-compose up -d --build
 else
-  docker build -t ${REPO_NAME,,}:latest .
-  docker run -d -p $APP_PORT:$APP_PORT ${REPO_NAME,,}:latest
+  # Convert REPO_NAME to lowercase using POSIX 'tr'
+  LOWER_REPO_NAME=$(echo "$REPO_NAME" | tr '[:upper:]' '[:lower:]')
+  docker build -t "${LOWER_REPO_NAME}:latest" .
+  docker run -d -p "$APP_PORT":"$APP_PORT" "${LOWER_REPO_NAME}:latest"
 fi
 
 echo " Checking running containers..."
 docker ps
 
 echo " Checking container logs..."
-CID=\$(docker ps -q --filter "ancestor=${REPO_NAME,,}:latest" | head -n 1)
-[ -n "\$CID" ] && docker logs \$CID | tail -n 10 || echo "No logs found for container."
+CID=$(docker ps -q --filter "ancestor=${LOWER_REPO_NAME}:latest" | head -n 1)
+if [ -n "$CID" ]; then
+  docker logs "$CID" | tail -n 10
+else
+  echo "No logs found for container."
+fi
 
 echo " Checking app on port $APP_PORT..."
-sudo netstat -tuln | grep $APP_PORT && echo " App running on port $APP_PORT"
-EOF
+if sudo netstat -tuln | grep -q "$APP_PORT"; then
+  echo " App running on port $APP_PORT"
+else
+  echo " App not running on port $APP_PORT"
+fi
+your app at http://$SERVER_IP:$APP_PORT"
 
-echo " Deployment complete! Access your app at http://$SERVER_IP:$APP_PORT"
-
-# === 6️⃣ Configure Nginx Reverse Proxy ===
+# === Configure Nginx Reverse Proxy ===
 echo " Configuring Nginx on $SERVER_IP..."
 ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash <<EOF
 set -e
